@@ -1,79 +1,131 @@
+#![allow(unused)]
+
 mod pattern;
 use pandoc_ast::{Block, Pandoc};
 use regex::Regex;
 use std::collections::hash_map::HashMap;
+use std::rc::Rc;
 
 const TIMEOUT_MS: u64 = 3000;
+const DEFAULT_PROMPT_CHAR: &str = ":";
 
 #[derive(Debug)]
-struct Pattern {
-    components: Vec<Vec<String>>,
+struct PandocBlock<'a> {
+    session_name: &'a str,
+    classes: &'a Vec<String>,
+    attrs: &'a Vec<(String, String)>,
+    code: &'a String,
 }
 
-impl Pattern {
-    fn new(text: &str) -> Self {
-        Self {
-            components: text
-                .split("...")
-                .map(|x| x.split("???").map(|x| x.to_string()).collect())
-                .collect(),
+fn iter_code_blocks<'a>(pandoc: &'a Pandoc) -> impl Iterator<Item = PandocBlock<'a>> + 'a {
+    pandoc.blocks.iter().filter_map(|block| {
+        if let pandoc_ast::Block::CodeBlock((_, classes, attrs), code) = block {
+            if let Some(session_name) = classes
+                .iter()
+                .filter(|x| x.starts_with("repl-"))
+                .map(|x| &x[5..])
+                .next()
+            {
+                Some(PandocBlock {
+                    session_name,
+                    classes,
+                    attrs,
+                    code,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
         }
-    }
+    })
 }
 
-struct Session {
-    pty: rexpect::session::PtySession,
-    prompt: Regex,
-    expected_output_lines: Vec<String>,
+#[derive(Debug)]
+struct ReplBlock<'a> {
+    prompt: Rc<Regex>,
+    prompt_char: &'a str,
+    expected_lines: Vec<&'a str>,
 }
 
-pub fn filter(pandoc: &mut Pandoc) -> anyhow::Result<()> {
+#[derive(Debug)]
+struct Session<'a> {
+    shell_cmd: &'a str,
+    blocks: Vec<ReplBlock<'a>>,
+}
+
+fn get_sessions<'a>(pandoc: &'a Pandoc) -> anyhow::Result<HashMap<&'a str, Session<'a>>> {
     let mut sessions = HashMap::new();
-    for ref mut block in pandoc.blocks.iter_mut() {
-        if let Block::CodeBlock((_, classes, attrs), ref mut code) = block {
-            let Some(session_name) = classes
-                    .iter()
-                    .filter(|x| x.starts_with("repl-"))
-                    .map(|x| &x[5..])
-                    .next() else {
-                        continue;
-                    };
-            let shell_command = attrs
-                .iter()
-                .filter(|(x, _)| x == "cmd")
-                .map(|(_, y)| y)
-                .next();
-            let prompt = attrs
-                .iter()
-                .filter(|(x, _)| x == "prompt")
-                .map(|(_, y)| y)
-                .map(|x| Regex::new(x).map_err(|e| anyhow::anyhow!("In session {session_name}: Bad regular expression for prompt: {x}: {e}")))
-                .next().transpose()?;
-            if !sessions.contains_key(session_name) {
-                let Some(shell_command) = shell_command else {
+    for PandocBlock {
+        session_name,
+        classes,
+        attrs,
+        code,
+    } in iter_code_blocks(pandoc)
+    {
+        let shell_cmd = attrs
+            .iter()
+            .filter(|(x, _)| x == "cmd")
+            .map(|(_, y)| y.as_str())
+            .next();
+        let prompt = attrs
+            .iter()
+            .filter(|(x, _)| x == "prompt")
+            .map(|(_, y)| y)
+            .map(|x| {
+                Regex::new(x).map(Rc::new).map_err(|e| {
+                    anyhow::anyhow!(
+                        "In session {session_name}: Bad regular expression for prompt: {x}: {e}"
+                    )
+                })
+            })
+            .next()
+            .transpose()?;
+        let prompt_char = attrs
+            .iter()
+            .filter(|(x, _)| x == "prompt_char")
+            .map(|(_, y)| y.as_str())
+            .next();
+        let expected_lines = code.lines().collect();
+
+        use std::collections::hash_map::Entry::*;
+        match sessions.entry(session_name) {
+            Vacant(entry) => {
+                let Some(shell_cmd) = shell_cmd else {
                     anyhow::bail!("No command provided at beginning of session {session_name}.");
                 };
                 let Some(prompt) = prompt else {
                     anyhow::bail!("Prompt must be specified for the session {session_name}.");
                 };
-                let pty = rexpect::spawn(shell_command.as_str(), Some(TIMEOUT_MS))?;
-                sessions.insert(
-                    session_name.to_string(),
-                    Session {
-                        pty,
+                let prompt_char = prompt_char.unwrap_or(DEFAULT_PROMPT_CHAR);
+                entry.insert(Session {
+                    shell_cmd,
+                    blocks: vec![ReplBlock {
                         prompt,
-                        expected_output_lines: vec![],
-                    },
-                );
-            } else {
-                if let Some(shell_command) = shell_command {
-                    anyhow::bail!("cmd is specified a second time for session {session_name} as `{shell_command}`.");
-                }
-                if let Some(prompt) = prompt {
-                    sessions.get_mut(session_name).unwrap().prompt = prompt;
-                }
+                        prompt_char,
+                        expected_lines,
+                    }],
+                });
             }
-            let session = sessions.get_mut(session_name).unwrap();
+            Occupied(mut entry) => {
+                if let Some(shell_cmd) = shell_cmd {
+                    anyhow::bail!("cmd is specified a second time for session {session_name} as `{shell_cmd}`.");
+                }
+                let last_block = entry.get().blocks.last().unwrap();
+                let prompt = prompt.unwrap_or_else(|| last_block.prompt.clone());
+                let prompt_char = prompt_char.unwrap_or(last_block.prompt_char);
+                entry.get_mut().blocks.push(ReplBlock {
+                    prompt,
+                    prompt_char,
+                    expected_lines,
+                });
+            }
+        }
+    }
+    Ok(sessions)
+}
+
+/*
             let mut output_buf = String::new();
             for line in code.lines() {
                 if let Some(prompt_match) = session.prompt.find_at(line, 0) {
@@ -117,7 +169,4 @@ pub fn filter(pandoc: &mut Pandoc) -> anyhow::Result<()> {
                     session.expected_output_lines.push(line.to_string());
                 }
             }
-        }
-    }
-    Ok(())
-}
+*/
