@@ -1,4 +1,13 @@
-#![allow(unused)]
+//! Utilities for matching and updating the expected with the actual command output.
+//!
+//! Both the expected and actual outputs are given as slices of lines.
+//! The matching works as follows (everything modulo trailing whitespaces):
+//! - All normal lines, that is every line which is not "..." or "???", are matched exactly.
+//! - Lines only consisting of "..." matches any number of arbitrary lines.
+//! - Lines only consisting of "???" matches any number of arbitrary lines and updates the expected
+//!     lines with the actual lines.
+
+use crate::LinesCow;
 use std::fmt;
 
 #[derive(thiserror::Error, Debug)]
@@ -20,52 +29,56 @@ impl<'a> fmt::Display for ParseError<'a> {
     }
 }
 
+/// The result when parsing. The ok value is a tuple of the remaining lines and an option which is
+/// `None` if nothing should be updated or `Some(lines)` if the input should be updated.
 type ParseResult<'a> = Result<(&'a [&'a str], Option<Vec<&'a str>>), ParseError<'a>>;
 
-fn match_lines<'a>(lines: &[&'a str], input_lines: &'a [&'a str]) -> ParseResult<'a> {
-    let mut i = 0;
-    while i < lines.len() {
-        if i == input_lines.len() {
+/// Match a list of lines exactly.
+/// Match exactly line by line.
+fn match_lines<'a>(expected: &[&'a str], actual: &'a [&'a str]) -> ParseResult<'a> {
+    let mut i = 0usize;
+    while i < expected.len() {
+        if i == actual.len() {
             return Err(ParseError {
-                expected: Some(lines[i]),
+                expected: Some(expected[i]),
                 got: None,
             });
         }
-        if lines[i] != input_lines[i] {
+        if expected[i].trim_end() != actual[i].trim_end() {
             return Err(ParseError {
-                expected: Some(lines[i]),
-                got: Some(input_lines[i]),
+                expected: Some(expected[i]),
+                got: Some(actual[i]),
             });
         }
         i += 1;
     }
-    Ok((&input_lines[i..], None))
+    Ok((&actual[i..], None))
 }
 
 fn with_holes<'a, const UPDATE: bool>(
     pattern: &mut impl FnMut(&[&'a str], &'a [&'a str]) -> ParseResult<'a>,
-    lines: &[&'a str],
-    input_lines: &'a [&'a str],
+    expected: &[&'a str],
+    actual: &'a [&'a str],
 ) -> ParseResult<'a> {
     let hole = if UPDATE { "???" } else { "..." };
-    match lines.iter().position(|line| line.trim() == hole) {
-        None => pattern(lines, input_lines),
+    match expected.iter().position(|line| line.trim() == hole) {
+        None => pattern(expected, actual),
         Some(hole_idx) => {
-            let before_hole = &lines[..hole_idx];
-            let after_hole = &lines[hole_idx + 1..];
+            let before_hole = &expected[..hole_idx];
+            let after_hole = &expected[hole_idx + 1..];
 
-            let (input_lines, updated_before) = pattern(before_hole, input_lines)?;
+            let (actual, updated_before) = pattern(before_hole, actual)?;
 
             let mut err = None;
-            for i in 0..=input_lines.len() {
-                match with_holes::<UPDATE>(pattern, after_hole, &input_lines[i..]) {
+            for i in 0..=actual.len() {
+                match with_holes::<UPDATE>(pattern, after_hole, &actual[i..]) {
                     Err(e) => err = Some(e),
                     Ok((remaining_input, updated_after)) => {
                         let push_hole_content = |x: &mut Vec<&'a str>| {
                             if UPDATE {
-                                x.extend_from_slice(&input_lines[..i])
+                                x.extend_from_slice(&actual[..i])
                             } else {
-                                x.push(lines[hole_idx])
+                                x.push(expected[hole_idx])
                             }
                         };
                         let updated = match (updated_before, updated_after) {
@@ -97,13 +110,13 @@ fn with_holes<'a, const UPDATE: bool>(
 }
 
 pub fn matchit<'a>(
-    pattern_lines: &[&'a str],
-    input_lines: &'a [&'a str],
-) -> Result<Option<Vec<String>>, ParseError<'a>> {
+    expected: &[&'a str],
+    actual: &'a [&'a str],
+) -> Result<Option<Vec<&'a str>>, ParseError<'a>> {
     let (remaining_input, updated) = with_holes::<true>(
         &mut |x, y| with_holes::<false>(&mut match_lines, x, y),
-        pattern_lines,
-        input_lines,
+        expected,
+        actual,
     )?;
     if !remaining_input.is_empty() {
         return Err(ParseError {
@@ -112,5 +125,5 @@ pub fn matchit<'a>(
         });
     }
 
-    Ok(updated.map(|x| x.into_iter().map(str::to_string).collect()))
+    Ok(updated)
 }
